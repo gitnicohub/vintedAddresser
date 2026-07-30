@@ -5,6 +5,7 @@ import time
 import html
 import random
 import logging
+import threading
 import requests
 
 # Configurazione dell'encoding stdout per Windows
@@ -14,7 +15,7 @@ if hasattr(sys.stdout, 'reconfigure'):
     except Exception:
         pass
 
-# Configurazione del Logging per visualizzare i dettagli di esecuzione
+# Configurazione del Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [%(levelname)s] - %(message)s',
@@ -23,8 +24,7 @@ logging.basicConfig(
     ]
 )
 
-# Tenta l'importazione di curl_cffi per impersonare un browser reale e superare i blocchi TLS/Cloudflare di Vinted.
-# Se non disponibile, effettua il fallback sul modulo standard 'requests'.
+# Tenta l'importazione di curl_cffi per impersonare un browser reale
 try:
     from curl_cffi import requests as curl_requests
     HAS_CURL_CFFI = True
@@ -54,27 +54,13 @@ load_env_file()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-
-# File locale per salvare gli ID degli articoli già notificati
 SEEN_FILE = "vinted_seen.json"
+SEARCHES_FILE = "vinted_searches.json"
 
-# Intervallo di tempo (in secondi)
-DELAY_BETWEEN_REQUESTS_MIN = 3  # Pausa tra una richiesta e l'altra
+DELAY_BETWEEN_REQUESTS_MIN = 3
 DELAY_BETWEEN_REQUESTS_MAX = 5
-CYCLE_SLEEP_TIME = 120          # Pausa di 120 secondi tra i cicli completi
+CYCLE_SLEEP_TIME = 30
 
-# ==========================================
-# 2. RICERCHE DA MONITORARE (URL API VINTED)
-# ==========================================
-SEARCH_URLS = [
-    # Ricerca 1 (Nike 20-70€, taglia 119, ordina per più recenti)
-    "https://www.vinted.it/api/v2/catalog/items?search_text=scarpe+uomo+nike&price_from=20&price_to=70&size_ids[]=119&order=newest_first",
-    
-    # Ricerca 2 (Filtri Custom e Multi-Brand fino a 80€, ordina per più recenti)
-    "https://www.vinted.it/api/v2/catalog/items?search_text=&catalog[]=1231&price_to=80.00&currency=EUR&brand_ids[]=53&brand_ids[]=5977&brand_ids[]=283953&brand_ids[]=687713&brand_ids[]=5774166&size_ids[]=788&order=newest_first"
-]
-
-# User-Agent moderno ed intestazioni HTTP per simulare un browser reale
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 
 COMMON_HEADERS = {
@@ -85,17 +71,86 @@ COMMON_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
+# Ricerche predefinite
+DEFAULT_SEARCHES = [
+    {
+        "id": "1",
+        "name": "Scarpe Nike (20-70€)",
+        "url": "https://www.vinted.it/api/v2/catalog/items?search_text=scarpe+uomo+nike&price_from=20&price_to=70&size_ids[]=119&order=newest_first",
+        "active": True
+    },
+    {
+        "id": "2",
+        "name": "Multi-Brand (fino a 80€)",
+        "url": "https://www.vinted.it/api/v2/catalog/items?search_text=&catalog[]=1231&price_to=80.00&currency=EUR&brand_ids[]=53&brand_ids[]=5977&brand_ids[]=283953&brand_ids[]=687713&brand_ids[]=5774166&size_ids[]=788&order=newest_first",
+        "active": True
+    }
+]
+
+# Stato globale del bot e delle ricerche
+searches_lock = threading.Lock()
+searches_data = []
+bot_is_running = True
+initialized_searches = set()  # Traccia quali ricerche hanno già popolato la baseline iniziale degli ID visti
+
 
 # ==========================================
-# 3. GESTIONE SESSIONE ED ANTI-SCRAPING
+# 2. GESTIONE CONVERSIONE URL E SALVATAGGIO RICERCHE
+# ==========================================
+def convert_to_vinted_api_url(raw_url):
+    """
+    Converte un URL web di Vinted (es. https://www.vinted.it/catalog?search_text=...)
+    nel corrispondente endpoint API Vinted (es. https://www.vinted.it/api/v2/catalog/items?...)
+    e assicura l'ordinamento per i più recenti.
+    """
+    url = raw_url.strip()
+    if "/catalog" in url and "/api/v2/catalog/items" not in url:
+        url = url.replace("/catalog", "/api/v2/catalog/items")
+    
+    if "order=" not in url:
+        delimiter = "&" if "?" in url else "?"
+        url += f"{delimiter}order=newest_first"
+    
+    return url
+
+
+def load_searches(filepath=SEARCHES_FILE):
+    """Carica le ricerche salvate da file JSON locale."""
+    global searches_data
+    with searches_lock:
+        if not os.path.exists(filepath):
+            searches_data = DEFAULT_SEARCHES
+            save_searches(filepath)
+            return
+        
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list) and len(data) > 0:
+                    searches_data = data
+                else:
+                    searches_data = DEFAULT_SEARCHES
+                    save_searches(filepath)
+        except Exception as e:
+            logging.error(f"Errore nel caricamento di '{filepath}': {e}. Uso ricerche di default.")
+            searches_data = DEFAULT_SEARCHES
+
+
+def save_searches(filepath=SEARCHES_FILE):
+    """Salva le ricerche nel file JSON locale."""
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(searches_data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logging.error(f"Errore nel salvataggio delle ricerche in '{filepath}': {e}")
+
+
+# ==========================================
+# 3. GESTIONE SESSIONE VINTED & VISTI
 # ==========================================
 def create_vinted_session():
-    """
-    Inizializza una sessione HTTP e recupera i cookie necessari da Vinted.
-    Per evitare errori 401/403, effettua prima una GET ad una pagina principale di Vinted.
-    """
+    """Inizializza una sessione HTTP per Vinted."""
     logging.info("Inizializzazione nuova sessione Vinted...")
-    
     if HAS_CURL_CFFI:
         session = curl_requests.Session(impersonate="chrome124")
     else:
@@ -103,18 +158,15 @@ def create_vinted_session():
     
     session.headers.update(COMMON_HEADERS)
 
-    # Inizializza i cookie visitando la pagina 'how_it_works' o la homepage
     try:
         response = session.get("https://www.vinted.it/how_it_works", timeout=12)
         if response.status_code != 200:
-            logging.warning(f"Chiamata how_it_works fallita con stato {response.status_code}. Tentativo homepage...")
+            logging.warning(f"Chiamata how_it_works fallita ({response.status_code}). Tentativo homepage...")
             response = session.get("https://www.vinted.it", timeout=12)
-        
-        logging.info(f"Sessione inizializzata con successo. Codice stato: {response.status_code}")
+        logging.info(f"Sessione Vinted inizializzata (Stato: {response.status_code}).")
     except Exception as e:
-        logging.error(f"Errore durante l'inizializzazione della sessione Vinted: {e}")
+        logging.error(f"Errore durante l'inizializzazione sessione Vinted: {e}")
 
-    # Imposta gli header per le successive chiamate API JSON
     session.headers.update({
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://www.vinted.it/catalog",
@@ -122,65 +174,326 @@ def create_vinted_session():
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
     })
-    
     return session
 
 
-# ==========================================
-# 4. GESTIONE FILE DEGLI ARTICOLI VISTI
-# ==========================================
 def load_seen_items(filepath=SEEN_FILE):
-    """
-    Carica dal file locale gli ID degli articoli già notificati.
-    Se il file non esiste, lo crea inizializzandolo come lista vuota.
-    """
+    """Carica gli ID degli articoli già visti."""
     if not os.path.exists(filepath):
-        logging.info(f"File '{filepath}' non trovato. Creazione nuovo file...")
         save_seen_items(filepath, set())
         return set()
-    
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, list):
                 return set(str(item_id) for item_id in data)
     except Exception as e:
-        logging.error(f"Errore nel caricamento del file degli articoli visti '{filepath}': {e}")
-    
+        logging.error(f"Errore caricamento articoli visti '{filepath}': {e}")
     return set()
 
 
 def save_seen_items(filepath, seen_ids):
-    """
-    Salva la lista aggiornata di ID visti nel file JSON locale.
-    Limita la dimensione massima della cronologia (es. ultimi 5000 elementi)
-    per evitare che il file diventi troppo grande nel tempo.
-    """
+    """Salva gli ID visti."""
     try:
-        # Mantieni al massimo 5000 articoli nella cronologia
         ids_to_save = list(seen_ids)[-5000:]
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(ids_to_save, f, indent=2)
     except Exception as e:
-        logging.error(f"Errore durante il salvataggio degli ID visti in '{filepath}': {e}")
+        logging.error(f"Errore salvataggio ID visti in '{filepath}': {e}")
 
 
 # ==========================================
-# 5. INVIO NOTIFICHE TELEGRAM
+# 4. TELEGRAM API HELPERS & MENU INTERATTIVO
 # ==========================================
-def send_telegram_notification(bot_token, chat_id, item):
-    """
-    Formatta le informazioni dell'articolo e le invia tramite il bot Telegram.
-    Usa 'sendPhoto' se è disponibile l'immagine dell'articolo, altrimenti 'sendMessage' come fallback.
-    Include anche un pulsante inline per aprire direttamente l'articolo su Vinted.
-    """
-    # Estrazione sicura dei campi dell'articolo
+def send_telegram_message(bot_token, chat_id, text, reply_markup=None):
+    """Invia un messaggio Telegram."""
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    try:
+        res = requests.post(url, data=payload, timeout=10)
+        return res.json()
+    except Exception as e:
+        logging.error(f"Errore invio messaggio Telegram: {e}")
+        return None
+
+
+def edit_message_text(bot_token, chat_id, message_id, text, reply_markup=None):
+    """Aggiorna un messaggio Telegram esistente."""
+    url = f"https://api.telegram.org/bot{bot_token}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    try:
+        requests.post(url, data=payload, timeout=10)
+    except Exception as e:
+        logging.error(f"Errore modifica messaggio Telegram: {e}")
+
+
+def answer_callback_query(bot_token, callback_query_id, text=None):
+    """Risponde ad una Callback Query di un pulsante inline."""
+    url = f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery"
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    try:
+        requests.post(url, data=payload, timeout=5)
+    except Exception:
+        pass
+
+
+def build_menu_text_and_keyboard():
+    """Genera il testo e l'Inline Keyboard per la selezione delle ricerche."""
+    global bot_is_running
+    with searches_lock:
+        searches = list(searches_data)
+    
+    status_str = "▶️ <b>IN ESECUZIONE</b>" if bot_is_running else "⏹️ <b>FERMATO</b>"
+    active_count = sum(1 for s in searches if s.get("active", True))
+    
+    text = (
+        f"⚙️ <b>GESTIONE RICERCHE VINTED BOT</b>\n\n"
+        f"📊 <b>Stato Bot:</b> {status_str}\n"
+        f"🎯 <b>Ricerche attive:</b> {active_count}/{len(searches)}\n\n"
+        f"<i>Tocca i pulsanti sotto per attivare (✅) o disattivare (❌) ciascuna ricerca:</i>"
+    )
+    
+    inline_keyboard = []
+    # Genera un pulsante per ciascuna ricerca
+    for s in searches:
+        s_id = str(s.get("id"))
+        s_name = s.get("name", f"Ricerca {s_id}")
+        is_active = s.get("active", True)
+        icon = "✅" if is_active else "❌"
+        
+        button_text = f"{icon} {s_name}"
+        inline_keyboard.append([{"text": button_text, "callback_data": f"toggle:{s_id}"}])
+    
+    # Riga di controllo bot
+    ctrl_row = []
+    if bot_is_running:
+        ctrl_row.append({"text": "⏹️ Ferma Bot", "callback_data": "action:stop"})
+    else:
+        ctrl_row.append({"text": "▶️ Avvia Bot", "callback_data": "action:start"})
+    ctrl_row.append({"text": "🔄 Aggiorna Menu", "callback_data": "action:refresh"})
+    inline_keyboard.append(ctrl_row)
+    
+    # Pulsante per guida su aggiunta/rimozione ricerche
+    inline_keyboard.append([{"text": "➕ Come Aggiungere/Rimuovere Ricerche", "callback_data": "action:help_add"}])
+    
+    return text, {"inline_keyboard": inline_keyboard}
+
+
+# ==========================================
+# 5. TELEGRAM BOT POLLING & COMANDI
+# ==========================================
+def process_telegram_update(bot_token, authorized_chat_id, update):
+    """Elabora ogni aggiornamento (messaggi e callback query) ricevuto da Telegram."""
+    global bot_is_running, searches_data
+
+    # 1. GESTIONE CALLBACK QUERY (PULSANTI INLINE)
+    if "callback_query" in update:
+        cb = update["callback_query"]
+        cb_id = cb["id"]
+        from_chat_id = str(cb["message"]["chat"]["id"])
+        message_id = cb["message"]["message_id"]
+        data = cb.get("data", "")
+
+        if authorized_chat_id and from_chat_id != str(authorized_chat_id):
+            answer_callback_query(bot_token, cb_id, "Non sei autorizzato ad usare questo bot.")
+            return
+
+        if data.startswith("toggle:"):
+            target_id = data.split(":", 1)[1]
+            status_msg = "Ricerca non trovata"
+            with searches_lock:
+                for s in searches_data:
+                    if str(s.get("id")) == target_id:
+                        s["active"] = not s.get("active", True)
+                        status_msg = f"Ricerca '{s.get('name')}' {'attivata ✅' if s['active'] else 'disattivata ❌'}"
+                        break
+                save_searches()
+            
+            answer_callback_query(bot_token, cb_id, status_msg)
+            menu_text, reply_markup = build_menu_text_and_keyboard()
+            edit_message_text(bot_token, from_chat_id, message_id, menu_text, reply_markup)
+
+        elif data == "action:start":
+            bot_is_running = True
+            answer_callback_query(bot_token, cb_id, "▶️ Bot Avviato!")
+            menu_text, reply_markup = build_menu_text_and_keyboard()
+            edit_message_text(bot_token, from_chat_id, message_id, menu_text, reply_markup)
+
+        elif data == "action:stop":
+            bot_is_running = False
+            answer_callback_query(bot_token, cb_id, "⏹️ Bot Fermato!")
+            menu_text, reply_markup = build_menu_text_and_keyboard()
+            edit_message_text(bot_token, from_chat_id, message_id, menu_text, reply_markup)
+
+        elif data == "action:refresh":
+            answer_callback_query(bot_token, cb_id, "🔄 Menu Aggiornato")
+            menu_text, reply_markup = build_menu_text_and_keyboard()
+            edit_message_text(bot_token, from_chat_id, message_id, menu_text, reply_markup)
+
+        elif data == "action:help_add":
+            help_text = (
+                "💡 <b>COME AGGIUNGERE O RIMUOVERE RICERCHE:</b>\n\n"
+                "🔹 <b>Aggiungere una ricerca:</b>\n"
+                "Invia un messaggio in chat col comando <code>/aggiungi</code>:\n"
+                "<code>/aggiungi Nome Ricerca | https://www.vinted.it/catalog?...</code>\n\n"
+                "<i>Esempio:</i>\n"
+                "<code>/aggiungi Felpe Adidas | https://www.vinted.it/catalog?search_text=adidas&price_to=30</code>\n\n"
+                "🔹 <b>Rimuovere una ricerca:</b>\n"
+                "Invia <code>/rimuovi &lt;ID&gt;</code> (es. <code>/rimuovi 1</code>)\n"
+                "Oppure digita <code>/ricerche</code> per vedere tutti gli ID."
+            )
+            answer_callback_query(bot_token, cb_id)
+            send_telegram_message(bot_token, from_chat_id, help_text)
+
+        return
+
+    # 2. GESTIONE MESSAGGI DI TESTO E COMANDI
+    if "message" in update:
+        msg = update["message"]
+        from_chat_id = str(msg["chat"]["id"])
+        text = msg.get("text", "").strip()
+
+        if authorized_chat_id and from_chat_id != str(authorized_chat_id):
+            return
+
+        if text.startswith("/start") or text.startswith("/menu") or text.startswith("/ricerche"):
+            menu_text, reply_markup = build_menu_text_and_keyboard()
+            send_telegram_message(bot_token, from_chat_id, menu_text, reply_markup)
+
+        elif text.startswith("/avvia"):
+            bot_is_running = True
+            menu_text, reply_markup = build_menu_text_and_keyboard()
+            send_telegram_message(bot_token, from_chat_id, "▶️ <b>Bot avviato con successo!</b>\n\n" + menu_text, reply_markup)
+
+        elif text.startswith("/ferma") or text.startswith("/stop"):
+            bot_is_running = False
+            menu_text, reply_markup = build_menu_text_and_keyboard()
+            send_telegram_message(bot_token, from_chat_id, "⏹️ <b>Bot fermato. Notifiche messe in pausa.</b>\n\n" + menu_text, reply_markup)
+
+        elif text.startswith("/aggiungi") or text.startswith("/add"):
+            parts = text.split(" ", 1)
+            if len(parts) < 2:
+                send_telegram_message(
+                    bot_token, from_chat_id,
+                    "⚠️ <b>Sintassi errata!</b> Usa:\n"
+                    "<code>/aggiungi Nome Ricerca | URL_VINTED</code>"
+                )
+                return
+            
+            content = parts[1].strip()
+            if "|" in content:
+                name_part, url_part = content.split("|", 1)
+                name = name_part.strip()
+                raw_url = url_part.strip()
+            else:
+                raw_url = content
+                name = f"Ricerca {len(searches_data) + 1}"
+            
+            api_url = convert_to_vinted_api_url(raw_url)
+            
+            with searches_lock:
+                new_id = str(max([int(s.get("id", 0)) for s in searches_data] + [0]) + 1)
+                new_search = {
+                    "id": new_id,
+                    "name": name,
+                    "url": api_url,
+                    "active": True
+                }
+                searches_data.append(new_search)
+                save_searches()
+            
+            reply = f"✅ <b>Ricerca aggiunta ed attivata!</b>\n\n📌 <b>ID:</b> {new_id}\n🏷️ <b>Nome:</b> {html.escape(name)}\n🔗 <b>URL API:</b> <code>{html.escape(api_url)}</code>"
+            send_telegram_message(bot_token, from_chat_id, reply)
+            menu_text, reply_markup = build_menu_text_and_keyboard()
+            send_telegram_message(bot_token, from_chat_id, menu_text, reply_markup)
+
+        elif text.startswith("/rimuovi") or text.startswith("/del"):
+            parts = text.split(" ", 1)
+            if len(parts) < 2:
+                send_telegram_message(bot_token, from_chat_id, "⚠️ Specifica l'ID della ricerca da rimuovere (es: <code>/rimuovi 1</code>)")
+                return
+            
+            target_id = parts[1].strip()
+            removed = False
+            removed_name = ""
+            
+            with searches_lock:
+                new_list = []
+                for s in searches_data:
+                    if str(s.get("id")) == target_id:
+                        removed = True
+                        removed_name = s.get("name")
+                    else:
+                        new_list.append(s)
+                if removed:
+                    searches_data = new_list
+                    save_searches()
+            
+            if removed:
+                send_telegram_message(bot_token, from_chat_id, f"🗑️ Ricerca <b>'{html.escape(removed_name)}'</b> (ID {target_id}) rimossa.")
+                menu_text, reply_markup = build_menu_text_and_keyboard()
+                send_telegram_message(bot_token, from_chat_id, menu_text, reply_markup)
+            else:
+                send_telegram_message(bot_token, from_chat_id, f"❌ Nessuna ricerca trovata con ID {target_id}.")
+
+        elif text.startswith("/status"):
+            with searches_lock:
+                searches = list(searches_data)
+            status_str = "▶️ IN ESECUZIONE" if bot_is_running else "⏹️ FERMATO"
+            msg = f"📊 <b>STATO VINTED BOT</b>: {status_str}\n\n<b>Ricerche configurate ({len(searches)}):</b>\n"
+            for s in searches:
+                icon = "✅" if s.get("active", True) else "❌"
+                msg += f"• [{icon}] ID {s.get('id')}: <b>{html.escape(s.get('name'))}</b>\n"
+            send_telegram_message(bot_token, from_chat_id, msg)
+
+
+def telegram_polling_thread(bot_token, authorized_chat_id):
+    """Thread in background per il polling continuo degli aggiornamenti Telegram."""
+    offset = 0
+    logging.info("Thread Polling Telegram avviato.")
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+            params = {"offset": offset, "timeout": 20}
+            res = requests.get(url, params=params, timeout=25)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("ok"):
+                    for update in data.get("result", []):
+                        offset = update["update_id"] + 1
+                        process_telegram_update(bot_token, authorized_chat_id, update)
+        except Exception as e:
+            logging.error(f"Errore nel polling Telegram: {e}")
+            time.sleep(3)
+
+
+# ==========================================
+# 6. INVIO NOTIFICHE TELEGRAM
+# ==========================================
+def send_telegram_notification(bot_token, chat_id, item, search_name=None):
+    """Invio notifica Telegram per un nuovo articolo trovato."""
     title = item.get("title", "Titolo non disponibile")
     brand = item.get("brand_title", "Non specificato")
     size = item.get("size_title", "Non specificata")
     status = item.get("status", "Non specificato")
     
-    # Gestione Prezzo
     price_obj = item.get("price")
     if isinstance(price_obj, dict):
         price_val = price_obj.get("amount", "N/D")
@@ -191,25 +504,24 @@ def send_telegram_notification(bot_token, chat_id, item):
     else:
         price_str = "N/D"
 
-    # Paese del venditore/pubblicazione
     user_info = item.get("user", {})
     country = user_info.get("country_title") or user_info.get("country_code") or item.get("country") or "Non specificato"
 
-    # URL dell'articolo
     item_url = item.get("url", "")
     if item_url and not item_url.startswith("http"):
         item_url = f"https://www.vinted.it{item_url}"
 
-    # URL della foto principale
     photo_url = None
     if item.get("photo") and isinstance(item["photo"], dict):
         photo_url = item["photo"].get("url")
     elif item.get("photos") and isinstance(item["photos"], list) and len(item["photos"]) > 0:
         photo_url = item["photos"][0].get("url")
 
-    # Formattazione del testo in HTML
+    search_info = f"\n🔍 <b>Ricerca:</b> {html.escape(str(search_name))}\n" if search_name else ""
+
     caption = (
-        f"🛍️ <b>NUOVO ARTICOLO SU VINTED!</b>\n\n"
+        f"🛍️ <b>NUOVO ARTICOLO SU VINTED!</b>\n"
+        f"{search_info}\n"
         f"📌 <b>Titolo:</b> {html.escape(str(title))}\n"
         f"💶 <b>Prezzo:</b> {html.escape(str(price_str))}\n"
         f"🏷️ <b>Brand:</b> {html.escape(str(brand))}\n"
@@ -219,14 +531,12 @@ def send_telegram_notification(bot_token, chat_id, item):
         f"🔗 <a href='{item_url}'>Visualizza su Vinted</a>"
     )
 
-    # Pulsante inline per accedere velocemente all'articolo
     reply_markup = {
         "inline_keyboard": [
             [{"text": "🛒 Apri su Vinted", "url": item_url}]
         ]
     }
 
-    # Prova ad inviare la foto con la didascalia
     if photo_url:
         telegram_api_url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
         payload = {
@@ -241,12 +551,10 @@ def send_telegram_notification(bot_token, chat_id, item):
             if res.status_code == 200:
                 logging.info(f"Notifica foto inviata per l'articolo ID {item.get('id')}")
                 return True
-            else:
-                logging.warning(f"Invio foto fallito (Stato {res.status_code}). Tentativo fallback messaggio testo...")
         except Exception as e:
             logging.error(f"Errore nell'invio della foto a Telegram: {e}")
 
-    # Fallback: invio solo messaggio di testo
+    # Fallback testo
     telegram_api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -269,22 +577,16 @@ def send_telegram_notification(bot_token, chat_id, item):
 
 
 # ==========================================
-# 6. LOGICA DI RICERCA ED ESECUZIONE BOT
+# 7. LOGICA DI RICERCA ED ESECUZIONE BOT
 # ==========================================
 def fetch_catalog_items(session, url):
-    """
-    Effettua la richiesta HTTP GET all'endpoint catalog Vinted.
-    Restituisce la lista di articoli trovati o solleva un'eccezione se la sessione scade.
-    """
+    """Richiesta HTTP GET all'endpoint catalog Vinted."""
     response = session.get(url, timeout=10)
-    
     if response.status_code in (401, 403):
         raise PermissionError(f"Sessione Vinted scaduta o bloccata (Codice {response.status_code})")
-    
     if response.status_code != 200:
-        logging.warning(f"Risposta non standard da Vinted (Codice {response.status_code}) per l'URL: {url}")
+        logging.warning(f"Risposta non standard da Vinted (Codice {response.status_code}) per URL: {url}")
         return []
-    
     data = response.json()
     return data.get("items", [])
 
@@ -293,70 +595,110 @@ def main():
     logging.info("Starting Vinted Telegram Bot...")
     
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID mancanti! Definiscili nel file .env o come variabili d'ambiente.")
+        logging.error("TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID mancanti! Definiscili nel file .env.")
         sys.exit(1)
     
-    # Carica la lista locale degli ID già visti
-
+    # Carica ricerche e articoli gia' visti
+    load_searches(SEARCHES_FILE)
     seen_ids = load_seen_items(SEEN_FILE)
-    logging.info(f"Caricati {len(seen_ids)} articoli già noti dalla memoria locale.")
+    logging.info(f"Caricati {len(seen_ids)} articoli visti e {len(searches_data)} ricerche configurate.")
 
-    # Inizializza la prima sessione
+    # Avvia thread Telegram Listener per i comandi ed il menu interattivo
+    t_telegram = threading.Thread(target=telegram_polling_thread, args=(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID), daemon=True)
+    t_telegram.start()
+
+    # Invia messaggio di benvenuto con menu su Telegram
+    menu_text, reply_markup = build_menu_text_and_keyboard()
+    send_telegram_message(
+        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+        "🤖 <b>Vinted Bot Avviato!</b>\n\nUtilizza il menu qui sotto per selezionare ed attivare le ricerche che desideri monitorare:",
+        reply_markup
+    )
+
     session = create_vinted_session()
-    
     cycle_counter = 0
 
     while True:
-        cycle_counter += 1
-        logging.info(f"--- Inizio Ciclo #{cycle_counter} ---")
+        if not bot_is_running:
+            time.sleep(3)
+            continue
 
-        for idx, url in enumerate(SEARCH_URLS, start=1):
-            logging.info(f"Controllo ricerca {idx}/{len(SEARCH_URLS)}...")
+        with searches_lock:
+            active_searches = [dict(s) for s in searches_data if s.get("active", True)]
+
+        if not active_searches:
+            time.sleep(5)
+            continue
+
+        cycle_counter += 1
+        logging.info(f"--- Inizio Ciclo #{cycle_counter} ({len(active_searches)} ricerche attive) ---")
+
+        for idx, search in enumerate(active_searches, start=1):
+            # Controllo immediato se il bot e' stato fermato da Telegram
+            if not bot_is_running:
+                logging.info("Esecuzione interrotta da Telegram durante il ciclo.")
+                break
+
+            search_id = str(search.get("id"))
+            search_name = search.get("name", f"Ricerca {idx}")
+            search_url = search.get("url")
+
+            logging.info(f"Controllo ricerca {idx}/{len(active_searches)}: '{search_name}'...")
 
             items = None
             try:
-                items = fetch_catalog_items(session, url)
+                items = fetch_catalog_items(session, search_url)
             except (PermissionError, Exception) as err:
-                logging.warning(f"Errore nella richiesta ({err}). Rigenerazione cookie/sessione in corso...")
+                logging.warning(f"Errore nella richiesta ({err}). Rigenerazione cookie/sessione...")
                 try:
-                    # Rigenera la sessione in caso di errore 401/403 o problemi di rete
                     session = create_vinted_session()
                     time.sleep(2)
-                    items = fetch_catalog_items(session, url)
+                    items = fetch_catalog_items(session, search_url)
                 except Exception as retry_err:
-                    logging.error(f"Impossibile completare la ricerca dopo il rinnovo della sessione: {retry_err}")
+                    logging.error(f"Impossibile completare la ricerca dopo rinnovo sessione: {retry_err}")
                     items = []
 
             if items:
+                # Se è la prima volta che eseguiamo questa ricerca, popoliamo i visti senza notificare in massa i vecchi articoli
+                if search_id not in initialized_searches:
+                    logging.info(f"Inizializzazione baseline articoli visti per '{search_name}' ({len(items)} articoli). Niente notifiche vecchie.")
+                    for item in items:
+                        item_id = str(item.get("id"))
+                        if item_id:
+                            seen_ids.add(item_id)
+                    save_seen_items(SEEN_FILE, seen_ids)
+                    initialized_searches.add(search_id)
+                    continue
+
                 new_items_count = 0
                 for item in items:
+                    # VERIFICA IMMEDIATA: Se il bot e' stato fermato o la ricerca disattivata, stop notifiche istantaneo!
+                    if not bot_is_running:
+                        logging.info("Notifiche interrotte: bot fermato da Telegram.")
+                        break
+
                     item_id = str(item.get("id"))
-                    
                     if item_id and item_id not in seen_ids:
                         logging.info(f"🔥 Trovato nuovo articolo! ID: {item_id} - Titolo: {item.get('title')}")
-                        
-                        # Invia notifica Telegram
-                        success = send_telegram_notification(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, item)
-                        
+                        success = send_telegram_notification(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, item, search_name=search_name)
                         if success:
                             seen_ids.add(item_id)
                             save_seen_items(SEEN_FILE, seen_ids)
                             new_items_count += 1
-                        
-                        # Piccola pausa tra l'invio delle notifiche per evitare rate-limit Telegram
                         time.sleep(1)
-                
-                logging.info(f"Ricerca {idx} completata. Nuovi articoli notificati: {new_items_count}")
+                logging.info(f"Ricerca '{search_name}' completata. Nuovi articoli notificati: {new_items_count}")
             else:
-                logging.info(f"Ricerca {idx} completata. Nessun nuovo articolo trovato o risposta vuota.")
+                logging.info(f"Ricerca '{search_name}' completata. Nessun nuovo articolo trovato.")
+                # Segna comunque la ricerca come inizializzata
+                initialized_searches.add(search_id)
 
-            # Pausa casuale tra 3 e 5 secondi tra le richieste a ciascuna ricerca
             delay = random.uniform(DELAY_BETWEEN_REQUESTS_MIN, DELAY_BETWEEN_REQUESTS_MAX)
-            logging.info(f"Pausa di {delay:.2f} secondi prima della prossima ricerca...")
+            logging.info(f"Pausa di {delay:.2f}s prima della prossima ricerca...")
             time.sleep(delay)
 
-        logging.info(f"--- Ciclo #{cycle_counter} completato. Pausa di {CYCLE_SLEEP_TIME} secondi prima del prossimo ciclo... ---")
-        time.sleep(CYCLE_SLEEP_TIME)
+        if bot_is_running:
+            logging.info(f"--- Ciclo #{cycle_counter} completato. Pausa di {CYCLE_SLEEP_TIME}s... ---")
+            time.sleep(CYCLE_SLEEP_TIME)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "1",
+    "name": "Scarpe Nike (20-70€)",
+    "url": "https://www.vinted.it/api/v2/catalog/items?search_text=scarpe+uomo+nike&price_from=20&price_to=70&size_ids[]=119&order=newest_first",
+    "active": false
+  },
+  {
+    "id": "2",
+    "name": "Nike (fino a 80€)",
+    "url": "https://www.vinted.it/api/v2/catalog/items?search_text=&catalog[]=1231&price_to=80.00&currency=EUR&brand_ids[]=53&brand_ids[]=5977&brand_ids[]=283953&brand_ids[]=687713&brand_ids[]=5774166&size_ids[]=788&order=newest_first",
+    "active": true
+  },
+  {
+    "id": "3",
+    "name": "New Balance (fino a 40€)",
+    "url": "https://www.vinted.it/catalog?search_text=&catalog[]=1231&price_to=40.00&currency=EUR&brand_ids[]=1775&size_ids[]=788&search_id=1110552811&order=newest_first",
+    "active": true
+  },
+  {
+    "id": "4",
+    "name": "Adidas",
+    "url": "https://www.vinted.it/catalog?search_text=&catalog[]=1231&brand_ids[]=14&brand_ids[]=115490&brand_ids[]=5758435&brand_ids[]=5808842&brand_ids[]=5977100&brand_ids[]=6397426&size_ids[]=788&size_ids[]=789&search_id=1466593250&order=newest_first",
+    "active": true
+  }
+]
