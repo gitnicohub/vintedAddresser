@@ -36,8 +36,24 @@ except ImportError:
 # ==========================================
 # 1. CONFIGURAZIONE E CREDENZIALI
 # ==========================================
-TELEGRAM_BOT_TOKEN = "8872633593:AAELnDfrfA8lrkr3Ht7f4rZneebRJD2JJgI"
-TELEGRAM_CHAT_ID = "1683111376"
+def load_env_file(filepath=".env"):
+    """Carica le variabili d'ambiente da un file .env locale se presente."""
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, value = line.split("=", 1)
+                        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+        except Exception as e:
+            logging.warning(f"Impossibile leggere il file '{filepath}': {e}")
+
+load_env_file()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 
 # File locale per salvare gli ID degli articoli già notificati
 SEEN_FILE = "vinted_seen.json"
@@ -276,7 +292,12 @@ def fetch_catalog_items(session, url):
 def main():
     logging.info("Starting Vinted Telegram Bot...")
     
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID mancanti! Definiscili nel file .env o come variabili d'ambiente.")
+        sys.exit(1)
+    
     # Carica la lista locale degli ID già visti
+
     seen_ids = load_seen_items(SEEN_FILE)
     logging.info(f"Caricati {len(seen_ids)} articoli già noti dalla memoria locale.")
 

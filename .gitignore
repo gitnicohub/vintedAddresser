@@ -8,3 +8,7 @@ __pycache__/
 
 # Local bot database / state
 vinted_seen.json
+
+# Environment configuration / secrets
+.env
+
