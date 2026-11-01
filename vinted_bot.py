@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import json
 import time
 import html
@@ -77,13 +78,13 @@ DEFAULT_SEARCHES = [
         "id": "1",
         "name": "Scarpe Nike (20-70€)",
         "url": "https://www.vinted.it/api/v2/catalog/items?search_text=scarpe+uomo+nike&price_from=20&price_to=70&size_ids[]=119&order=newest_first",
-        "active": True
+        "active": False
     },
     {
         "id": "2",
         "name": "Multi-Brand (fino a 80€)",
         "url": "https://www.vinted.it/api/v2/catalog/items?search_text=&catalog[]=1231&price_to=80.00&currency=EUR&brand_ids[]=53&brand_ids[]=5977&brand_ids[]=283953&brand_ids[]=687713&brand_ids[]=5774166&size_ids[]=788&order=newest_first",
-        "active": True
+        "active": False
     }
 ]
 
@@ -91,6 +92,7 @@ DEFAULT_SEARCHES = [
 searches_lock = threading.Lock()
 searches_data = []
 bot_is_running = True
+current_scanning_search = ""
 initialized_searches = set()  # Traccia quali ricerche hanno già popolato la baseline iniziale degli ID visti
 
 
@@ -99,18 +101,19 @@ initialized_searches = set()  # Traccia quali ricerche hanno già popolato la ba
 # ==========================================
 def convert_to_vinted_api_url(raw_url):
     """
-    Converte un URL web di Vinted (es. https://www.vinted.it/catalog?search_text=...)
-    nel corrispondente endpoint API Vinted (es. https://www.vinted.it/api/v2/catalog/items?...)
-    e assicura l'ordinamento per i più recenti.
+    Normalizza un URL di ricerca Vinted verso la pagina web del catalogo
+    (https://www.vinted.it/catalog?...), dato che l'API /api/v2/catalog/items
+    non e' piu' disponibile (404). Accetta sia URL web che vecchi URL API
+    e assicura l'ordinamento per i piu' recenti.
     """
     url = raw_url.strip()
-    if "/catalog" in url and "/api/v2/catalog/items" not in url:
-        url = url.replace("/catalog", "/api/v2/catalog/items")
-    
+    if "/api/v2/catalog/items" in url:
+        url = url.replace("/api/v2/catalog/items", "/catalog")
+
     if "order=" not in url:
         delimiter = "&" if "?" in url else "?"
         url += f"{delimiter}order=newest_first"
-    
+
     return url
 
 
@@ -126,7 +129,7 @@ def load_searches(filepath=SEARCHES_FILE):
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, list) and len(data) > 0:
+                if isinstance(data, list):
                     searches_data = data
                 else:
                     searches_data = DEFAULT_SEARCHES
@@ -167,13 +170,6 @@ def create_vinted_session():
     except Exception as e:
         logging.error(f"Errore durante l'inizializzazione sessione Vinted: {e}")
 
-    session.headers.update({
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.vinted.it/catalog",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-    })
     return session
 
 
@@ -256,18 +252,38 @@ def answer_callback_query(bot_token, callback_query_id, text=None):
 
 def build_menu_text_and_keyboard():
     """Genera il testo e l'Inline Keyboard per la selezione delle ricerche."""
-    global bot_is_running
+    global bot_is_running, current_scanning_search
     with searches_lock:
         searches = list(searches_data)
     
     status_str = "▶️ <b>IN ESECUZIONE</b>" if bot_is_running else "⏹️ <b>FERMATO</b>"
-    active_count = sum(1 for s in searches if s.get("active", True))
+    active_searches = [s for s in searches if bool(s.get("active", False))]
+    inactive_searches = [s for s in searches if not bool(s.get("active", False))]
+    
+    active_count = len(active_searches)
+    
+    # Costruisci l'elenco testuale dettagliato delle ricerche ATTIVE
+    if active_searches:
+        active_list_str = "\n".join([f"  ✅ <b>[ID {s.get('id')}]</b> {html.escape(s.get('name', ''))}" for s in active_searches])
+    else:
+        active_list_str = "  <i>(Nessuna ricerca attiva)</i>"
+
+    # Costruisci l'elenco testuale delle ricerche DISATTIVATE
+    if inactive_searches:
+        inactive_list_str = "\n".join([f"  ❌ <b>[ID {s.get('id')}]</b> {html.escape(s.get('name', ''))}" for s in inactive_searches])
+    else:
+        inactive_list_str = "  <i>(Nessuna ricerca disattivata)</i>"
+        
+    scanning_str = f"🔎 <b>In scansione ora:</b> <i>{html.escape(current_scanning_search)}</i>\n" if (bot_is_running and current_scanning_search) else ""
     
     text = (
         f"⚙️ <b>GESTIONE RICERCHE VINTED BOT</b>\n\n"
         f"📊 <b>Stato Bot:</b> {status_str}\n"
-        f"🎯 <b>Ricerche attive:</b> {active_count}/{len(searches)}\n\n"
-        f"<i>Tocca i pulsanti sotto per attivare (✅) o disattivare (❌) ciascuna ricerca:</i>"
+        f"🎯 <b>Ricerche attive:</b> {active_count}/{len(searches)}\n"
+        f"{scanning_str}\n"
+        f"🟢 <b>RICERCHE ATTIVATE:</b>\n{active_list_str}\n\n"
+        f"🔴 <b>RICERCHE DISATTIVATE:</b>\n{inactive_list_str}\n\n"
+        f"<i>Tocca i pulsanti in basso per attivare (✅) o disattivare (❌) le singole ricerche:</i>"
     )
     
     inline_keyboard = []
@@ -275,10 +291,10 @@ def build_menu_text_and_keyboard():
     for s in searches:
         s_id = str(s.get("id"))
         s_name = s.get("name", f"Ricerca {s_id}")
-        is_active = s.get("active", True)
-        icon = "✅" if is_active else "❌"
+        is_active = bool(s.get("active", False))
+        icon = "✅ ATTIVA" if is_active else "❌ DISATTIVATA"
         
-        button_text = f"{icon} {s_name}"
+        button_text = f"[{icon}] {s_name}"
         inline_keyboard.append([{"text": button_text, "callback_data": f"toggle:{s_id}"}])
     
     # Riga di controllo bot
@@ -321,7 +337,7 @@ def process_telegram_update(bot_token, authorized_chat_id, update):
             with searches_lock:
                 for s in searches_data:
                     if str(s.get("id")) == target_id:
-                        s["active"] = not s.get("active", True)
+                        s["active"] = not bool(s.get("active", False))
                         status_msg = f"Ricerca '{s.get('name')}' {'attivata ✅' if s['active'] else 'disattivata ❌'}"
                         break
                 save_searches()
@@ -505,7 +521,8 @@ def send_telegram_notification(bot_token, chat_id, item, search_name=None):
         price_str = "N/D"
 
     user_info = item.get("user", {})
-    country = user_info.get("country_title") or user_info.get("country_code") or item.get("country") or "Non specificato"
+    country = user_info.get("country_title") or user_info.get("country_code") or item.get("country")
+    country_line = f"🌍 <b>Paese:</b> {html.escape(str(country))}\n" if country else ""
 
     item_url = item.get("url", "")
     if item_url and not item_url.startswith("http"):
@@ -527,7 +544,7 @@ def send_telegram_notification(bot_token, chat_id, item, search_name=None):
         f"🏷️ <b>Brand:</b> {html.escape(str(brand))}\n"
         f"📏 <b>Taglia:</b> {html.escape(str(size))}\n"
         f"✨ <b>Stato:</b> {html.escape(str(status))}\n"
-        f"🌍 <b>Paese:</b> {html.escape(str(country))}\n\n"
+        f"{country_line}\n"
         f"🔗 <a href='{item_url}'>Visualizza su Vinted</a>"
     )
 
@@ -579,19 +596,56 @@ def send_telegram_notification(bot_token, chat_id, item, search_name=None):
 # ==========================================
 # 7. LOGICA DI RICERCA ED ESECUZIONE BOT
 # ==========================================
+FLIGHT_CHUNK_RE = re.compile(r'self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)')
+ITEMS_MARKER = '"items":{"items":'
+
+
+def parse_catalog_html(page_html):
+    """Estrae gli articoli dai dati Next.js incorporati nella pagina del catalogo."""
+    chunks = FLIGHT_CHUNK_RE.findall(page_html)
+    data = "".join(json.loads(c) for c in chunks)
+    pos = data.find(ITEMS_MARKER)
+    if pos == -1:
+        raise ValueError("Dati articoli non trovati nella pagina (layout Vinted cambiato?)")
+    raw_items, _ = json.JSONDecoder().raw_decode(data[pos + len(ITEMS_MARKER):])
+
+    items = []
+    for entry in raw_items:
+        prod = entry.get("productItem") or {}
+        if not prod.get("id"):
+            continue
+        box = prod.get("itemBox") or {}
+        second = box.get("secondLine") or ""
+        size, _, status = second.partition(" · ")
+        price = prod.get("price") or {}
+        photos = prod.get("photos") or []
+        photo_url = photos[0].get("url") if photos else prod.get("thumbnailUrl")
+        items.append({
+            "id": prod["id"],
+            "title": prod.get("title"),
+            "brand_title": box.get("firstLine") or "Non specificato",
+            "size_title": size or "Non specificata",
+            "status": status or "Non specificato",
+            "price": {"amount": price.get("amount"), "currency_code": price.get("currencyCode", "EUR")},
+            "url": prod.get("url", ""),
+            "photo": {"url": photo_url} if photo_url else None,
+        })
+    return items
+
+
 def fetch_catalog_items(session, url):
-    """Richiesta HTTP GET all'endpoint catalog Vinted."""
-    response = session.get(url, timeout=10)
+    """Scarica la pagina catalogo Vinted e ne estrae gli articoli."""
+    response = session.get(url, timeout=15)
     if response.status_code in (401, 403):
         raise PermissionError(f"Sessione Vinted scaduta o bloccata (Codice {response.status_code})")
     if response.status_code != 200:
         logging.warning(f"Risposta non standard da Vinted (Codice {response.status_code}) per URL: {url}")
         return []
-    data = response.json()
-    return data.get("items", [])
+    return parse_catalog_html(response.text)
 
 
 def main():
+    global current_scanning_search
     logging.info("Starting Vinted Telegram Bot...")
     
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -620,13 +674,15 @@ def main():
 
     while True:
         if not bot_is_running:
+            current_scanning_search = "Bot in pausa ⏹️"
             time.sleep(3)
             continue
 
         with searches_lock:
-            active_searches = [dict(s) for s in searches_data if s.get("active", True)]
+            active_searches = [dict(s) for s in searches_data if bool(s.get("active", False))]
 
         if not active_searches:
+            current_scanning_search = "Nessuna ricerca attiva ⚠️"
             time.sleep(5)
             continue
 
@@ -636,13 +692,15 @@ def main():
         for idx, search in enumerate(active_searches, start=1):
             # Controllo immediato se il bot e' stato fermato da Telegram
             if not bot_is_running:
+                current_scanning_search = "Bot in pausa ⏹️"
                 logging.info("Esecuzione interrotta da Telegram durante il ciclo.")
                 break
 
             search_id = str(search.get("id"))
             search_name = search.get("name", f"Ricerca {idx}")
-            search_url = search.get("url")
+            search_url = convert_to_vinted_api_url(search.get("url", ""))
 
+            current_scanning_search = f"{search_name} ({idx}/{len(active_searches)})"
             logging.info(f"Controllo ricerca {idx}/{len(active_searches)}: '{search_name}'...")
 
             items = None
@@ -674,6 +732,7 @@ def main():
                 for item in items:
                     # VERIFICA IMMEDIATA: Se il bot e' stato fermato o la ricerca disattivata, stop notifiche istantaneo!
                     if not bot_is_running:
+                        current_scanning_search = "Bot in pausa ⏹️"
                         logging.info("Notifiche interrotte: bot fermato da Telegram.")
                         break
 
@@ -697,6 +756,7 @@ def main():
             time.sleep(delay)
 
         if bot_is_running:
+            current_scanning_search = f"Pausa tra i cicli ({CYCLE_SLEEP_TIME}s) 💤"
             logging.info(f"--- Ciclo #{cycle_counter} completato. Pausa di {CYCLE_SLEEP_TIME}s... ---")
             time.sleep(CYCLE_SLEEP_TIME)
 
