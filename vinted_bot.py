@@ -61,6 +61,8 @@ SEARCHES_FILE = "vinted_searches.json"
 DELAY_BETWEEN_REQUESTS_MIN = 3
 DELAY_BETWEEN_REQUESTS_MAX = 5
 CYCLE_SLEEP_TIME = 30
+MAX_SEEN_IDS = 5000
+ALERT_AFTER_FAILED_CYCLES = 5  # cicli consecutivi senza risultati prima di avvisare su Telegram
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 
@@ -174,24 +176,24 @@ def create_vinted_session():
 
 
 def load_seen_items(filepath=SEEN_FILE):
-    """Carica gli ID degli articoli già visti."""
+    """Carica gli ID degli articoli già visti (dict ordinato per inserimento: valori ignorati)."""
     if not os.path.exists(filepath):
-        save_seen_items(filepath, set())
-        return set()
+        save_seen_items(filepath, {})
+        return {}
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, list):
-                return set(str(item_id) for item_id in data)
+                return dict.fromkeys(str(item_id) for item_id in data)
     except Exception as e:
         logging.error(f"Errore caricamento articoli visti '{filepath}': {e}")
-    return set()
+    return {}
 
 
 def save_seen_items(filepath, seen_ids):
-    """Salva gli ID visti."""
+    """Salva gli ID visti, mantenendo gli ultimi MAX_SEEN_IDS in ordine di inserimento."""
     try:
-        ids_to_save = list(seen_ids)[-5000:]
+        ids_to_save = list(seen_ids)[-MAX_SEEN_IDS:]
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(ids_to_save, f, indent=2)
     except Exception as e:
@@ -495,6 +497,20 @@ def telegram_polling_thread(bot_token, authorized_chat_id):
                     for update in data.get("result", []):
                         offset = update["update_id"] + 1
                         process_telegram_update(bot_token, authorized_chat_id, update)
+                else:
+                    time.sleep(5)
+            else:
+                wait = 5
+                if res.status_code == 429:
+                    try:
+                        wait = int(res.json().get("parameters", {}).get("retry_after", 10))
+                    except Exception:
+                        wait = 10
+                elif res.status_code == 409:
+                    logging.warning("Polling Telegram: conflitto (409). Un'altra istanza del bot e' in esecuzione?")
+                    wait = 15
+                logging.warning(f"Polling Telegram: risposta {res.status_code}, riprovo tra {wait}s.")
+                time.sleep(wait)
         except Exception as e:
             logging.error(f"Errore nel polling Telegram: {e}")
             time.sleep(3)
@@ -671,6 +687,8 @@ def main():
 
     session = create_vinted_session()
     cycle_counter = 0
+    failed_cycles = 0
+    alert_sent = False
 
     while True:
         if not bot_is_running:
@@ -688,6 +706,7 @@ def main():
 
         cycle_counter += 1
         logging.info(f"--- Inizio Ciclo #{cycle_counter} ({len(active_searches)} ricerche attive) ---")
+        cycle_got_items = False
 
         for idx, search in enumerate(active_searches, start=1):
             # Controllo immediato se il bot e' stato fermato da Telegram
@@ -717,13 +736,14 @@ def main():
                     items = []
 
             if items:
+                cycle_got_items = True
                 # Se è la prima volta che eseguiamo questa ricerca, popoliamo i visti senza notificare in massa i vecchi articoli
                 if search_id not in initialized_searches:
                     logging.info(f"Inizializzazione baseline articoli visti per '{search_name}' ({len(items)} articoli). Niente notifiche vecchie.")
                     for item in items:
                         item_id = str(item.get("id"))
                         if item_id:
-                            seen_ids.add(item_id)
+                            seen_ids[item_id] = None
                     save_seen_items(SEEN_FILE, seen_ids)
                     initialized_searches.add(search_id)
                     continue
@@ -741,19 +761,36 @@ def main():
                         logging.info(f"🔥 Trovato nuovo articolo! ID: {item_id} - Titolo: {item.get('title')}")
                         success = send_telegram_notification(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, item, search_name=search_name)
                         if success:
-                            seen_ids.add(item_id)
+                            seen_ids[item_id] = None
                             save_seen_items(SEEN_FILE, seen_ids)
                             new_items_count += 1
                         time.sleep(1)
                 logging.info(f"Ricerca '{search_name}' completata. Nuovi articoli notificati: {new_items_count}")
             else:
-                logging.info(f"Ricerca '{search_name}' completata. Nessun nuovo articolo trovato.")
-                # Segna comunque la ricerca come inizializzata
-                initialized_searches.add(search_id)
+                # Non segnare la ricerca come inizializzata: con una risposta vuota/errata la baseline
+                # non e' stata popolata e al prossimo risultato valido verrebbero notificati tutti i vecchi articoli.
+                logging.info(f"Ricerca '{search_name}' completata. Nessun risultato (o errore): baseline non aggiornata.")
 
             delay = random.uniform(DELAY_BETWEEN_REQUESTS_MIN, DELAY_BETWEEN_REQUESTS_MAX)
             logging.info(f"Pausa di {delay:.2f}s prima della prossima ricerca...")
             time.sleep(delay)
+
+        # Allarme su Telegram se Vinted non restituisce piu' nulla per piu' cicli consecutivi
+        if bot_is_running:
+            if cycle_got_items:
+                if alert_sent:
+                    send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, "✅ <b>Vinted risponde di nuovo</b>: le ricerche tornano a restituire articoli.")
+                failed_cycles = 0
+                alert_sent = False
+            else:
+                failed_cycles += 1
+                if failed_cycles >= ALERT_AFTER_FAILED_CYCLES and not alert_sent:
+                    send_telegram_message(
+                        TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+                        f"⚠️ <b>Attenzione</b>: da {failed_cycles} cicli consecutivi Vinted non restituisce articoli "
+                        "(blocco, errore di rete o layout della pagina cambiato). Controlla il log del bot."
+                    )
+                    alert_sent = True
 
         if bot_is_running:
             current_scanning_search = f"Pausa tra i cicli ({CYCLE_SLEEP_TIME}s) 💤"
